@@ -1,39 +1,30 @@
-import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-import { VitePWA } from 'vite-plugin-pwa'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
-  base: '/TrackIt/', 
+  base: '/TrackIt/', // Keep this!
+
   plugins: [
     react(),
     VitePWA({
       registerType: 'autoUpdate',
-      // --- ADD THIS SECTION ---
-      devOptions: {
-        enabled: true 
-      },
-      // ------------------------
+      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'masked-icon.svg'],
       manifest: {
         name: 'TrackIt',
         short_name: 'TrackIt',
-        start_url: './',
-        display: 'standalone',
-        background_color: '#ffffff',
+        description: 'Simple goal and habit tracker',
         theme_color: '#ffffff',
+        start_url: '/TrackIt/',
+        scope: '/TrackIt/',
         icons: [
           {
-            src: 'activity.svg',
-            sizes: 'any',
-            type: 'image/svg+xml',
-            purpose: 'any maskable'
-          },
-          {
-            src: 'pwa-192x192.png',
+            src: 'android-chrome-192x192.png',
             sizes: '192x192',
             type: 'image/png'
           },
           {
-            src: 'pwa-512x512.png',
+            src: 'android-chrome-512x512.png',
             sizes: '512x512',
             type: 'image/png'
           }
@@ -41,4 +32,23 @@ export default defineConfig({
       }
     })
   ],
-})
+  build: {
+    chunkSizeWarningLimit: 1000, 
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes('node_modules')) {
+            // 1. Keep Firebase separate because it is heavy
+            if (id.includes('firebase')) {
+              return 'firebase';
+            }
+            
+            // 2. Put EVERYTHING else (React, Charts, etc.) in one vendor file
+            // This fixes the "undefined forwardRef" error by keeping dependencies together.
+            return 'vendor';
+          }
+        }
+      }
+    }
+  }
+});
