@@ -3,13 +3,14 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig({
-  base: '/TrackIt/', // Keep this!
+  base: '/TrackIt/',
 
   plugins: [
     react(),
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['favicon.ico', 'apple-touch-icon.png', 'masked-icon.svg'],
+      // FIX: Removed 'masked-icon.svg' because it does not exist in your public folder
+      includeAssets: ['favicon.ico', 'apple-touch-icon.png'],
       manifest: {
         name: 'TrackIt',
         short_name: 'TrackIt',
@@ -38,13 +39,9 @@ export default defineConfig({
       output: {
         manualChunks(id) {
           if (id.includes('node_modules')) {
-            // 1. Keep Firebase separate because it is heavy
             if (id.includes('firebase')) {
               return 'firebase';
             }
-            
-            // 2. Put EVERYTHING else (React, Charts, etc.) in one vendor file
-            // This fixes the "undefined forwardRef" error by keeping dependencies together.
             return 'vendor';
           }
         }
