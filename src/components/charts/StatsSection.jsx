@@ -76,7 +76,8 @@ export const StatsSection = ({ entries, tracker }) => {
     // Helper to determine Goal Card Subtext
     const getGoalSubtext = () => {
         if (trendData) {
-            return `Est. ${trendData.daysLeft} days left (${formatIsoDate(trendData.date)})`;
+            // UPDATED: Removed the exact date, keeping only "Est. X days left"
+            return `Est. ${trendData.daysLeft} days left`;
         }
         if (tracker.goalDirection === 'target') return `Target: ${tracker.targetValue}`;
         return 'Direction';

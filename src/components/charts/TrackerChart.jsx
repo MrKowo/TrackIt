@@ -1,204 +1,307 @@
-import React, { useMemo } from 'react';
-import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler } from 'chart.js';
+import React, { useMemo, useRef, useCallback } from 'react';
+import { 
+  Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, 
+  Title, Tooltip, Legend, Filler, TimeScale 
+} from 'chart.js';
 import { Line } from 'react-chartjs-2';
+import zoomPlugin from 'chartjs-plugin-zoom';
+import { RotateCcw } from 'lucide-react';
 import { formatIsoDate, calculateAggregate, formatDate, calculateTrendProjection } from '../../lib/utils';
 import { useTheme } from '../../context/ThemeContext';
+import 'chartjs-adapter-date-fns';
 
-ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler, TimeScale, zoomPlugin);
 
-export const TrackerChart = ({ entries, tracker, onDateClick }) => {
-    const { theme, themeMode, isAmoled } = useTheme();
-
-    const { chartData, fullDateLabels } = useMemo(() => {
-        if (!entries || entries.length === 0) return { chartData: { labels: [], datasets: [] }, fullDateLabels: [] };
-        
-        // 1. Group Data by Date
-        const groups = {};
-        entries.forEach(e => {
-            const date = formatIsoDate(e.date);
-            if(!groups[date]) groups[date] = [];
-            groups[date].push(Number(e.value));
-        });
-        
-        const realDates = Object.keys(groups).sort((a,b) => new Date(a) - new Date(b));
-        if (realDates.length === 0) return { chartData: { labels: [], datasets: [] }, fullDateLabels: [] };
-
-        // 2. Determine Time Range (Start to End OR Start to Trend Date)
-        const startDate = new Date(realDates[0]);
-        let endDate = new Date(realDates[realDates.length - 1]);
-        
-        // Check for Trend Projection to extend the End Date
-        let trend = null;
-        if (tracker.showTrendForecast && entries.length > 1) {
-            trend = calculateTrendProjection(entries, tracker);
-            if (trend) {
-                const trendDateObj = new Date(trend.date);
-                if (trendDateObj > endDate) {
-                    endDate = trendDateObj; // Extend chart to the future
-                }
-            }
-        }
-
-        const dateArray = [];
-        const dataValues = [];
-        
-        // 3. GENERATE FULL LINEAR TIMELINE (Start -> End/Trend)
-        for (let d = new Date(startDate); d <= endDate; d.setDate(d.getDate() + 1)) {
-            const iso = formatIsoDate(d);
-            dateArray.push(iso);
-
-            // Populate Main Data (only if it exists in real entries)
-            if (groups[iso]) {
-                const method = tracker.aggregation || 'average';
-                dataValues.push(calculateAggregate(groups[iso], method));
-            } else {
-                dataValues.push(null);
-            }
-        }
-
-        // Post-processing for Cumulative Goals (Fill nulls)
-        if (tracker.aggregation === 'sum' && tracker.goalPeriod !== 'daily') {
-            let runningTotal = 0;
-            for (let i = 0; i < dataValues.length; i++) {
-                if (dataValues[i] !== null) {
-                    runningTotal += dataValues[i];
-                    dataValues[i] = runningTotal;
-                } else {
-                    dataValues[i] = runningTotal;
-                }
-            }
-        }
-        
-        // 4. Prepare Labels & Datasets
-        const labels = dateArray.map(d => formatDate(d));
-        
-        const mainDataset = {
-            label: tracker.name,
-            data: [...dataValues], 
-            borderColor: theme.chartLine,
-            backgroundColor: theme.chartFill,
-            tension: 0.3,
-            fill: true,
-            pointBackgroundColor: theme.chartPoint,
-            pointRadius: (ctx) => (ctx.raw === null ? 0 : 4), 
-            pointHoverRadius: (ctx) => (ctx.raw === null ? 0 : 6),
-            spanGaps: true, 
+// --- 1. PURE HELPER: Data Processing Logic ---
+const processChartData = (entries, tracker, theme, isAmoled) => {
+    if (!entries || entries.length === 0) {
+        return { 
+            chartData: { datasets: [] }, 
+            minDate: Date.now(), maxDate: Date.now(), 
+            lastEntryDate: Date.now(), 
+            firstEntryDate: Date.now(),
+            yMin: 0, yMax: 10 
         };
+    }
 
-        const datasets = [mainDataset];
+    // A. Calculate Y-Axis Limits
+    const values = entries.map(e => Number(e.value));
+    let minY = Math.min(...values);
+    let maxY = Math.max(...values);
+    
+    if (tracker.targetValue) {
+        minY = Math.min(minY, tracker.targetValue);
+        maxY = Math.max(maxY, tracker.targetValue);
+    }
+    
+    const padding = (maxY - minY) * 0.1 || 1;
+    const finalYMin = minY - padding;
+    const finalYMax = maxY + padding;
 
-        // --- FEATURE: TARGET LINE ---
+    // B. Group & Sort Data
+    const groups = {};
+    entries.forEach(e => {
+        const date = formatIsoDate(e.date);
+        if(!groups[date]) groups[date] = [];
+        groups[date].push(Number(e.value));
+    });
+    
+    const realDates = Object.keys(groups).sort((a,b) => new Date(a) - new Date(b));
+    const startDate = new Date(realDates[0]);
+    const lastRealEntryDate = new Date(realDates[realDates.length - 1]);
+    
+    let endDate = new Date(lastRealEntryDate);
+
+    // C. Trend Logic
+    let trend = null;
+    if (tracker.showTrendForecast && entries.length > 1) {
+        trend = calculateTrendProjection(entries, tracker);
+        if (trend && new Date(trend.date) > endDate) {
+            endDate = new Date(trend.date);
+        }
+    }
+
+    // D. Build Datasets
+    const mainData = [];
+    const trendData = [];
+    const targetData = [];
+    
+    const current = new Date(startDate);
+    current.setHours(0,0,0,0);
+    endDate.setHours(0,0,0,0);
+    lastRealEntryDate.setHours(0,0,0,0);
+
+    let lastVal = null;
+    let lastTime = null;
+
+    while (current <= endDate) {
+        const timestamp = current.getTime();
+        const iso = formatIsoDate(current);
+
+        if (groups[iso]) {
+            const val = calculateAggregate(groups[iso], tracker.aggregation || 'average');
+            mainData.push({ x: timestamp, y: val });
+            lastVal = val;
+            lastTime = timestamp;
+        } else {
+            mainData.push({ x: timestamp, y: null });
+        }
+
         if (tracker.goalDirection === 'target' && tracker.targetValue) {
-            datasets.push({
-                label: 'Target',
-                data: new Array(labels.length).fill(tracker.targetValue),
-                borderColor: isAmoled ? '#22c55e' : '#16a34a', 
-                borderDash: [5, 5],
-                pointRadius: 0,
-                borderWidth: 2,
-                fill: false,
-                tension: 0
-            });
+            targetData.push({ x: timestamp, y: tracker.targetValue });
         }
 
-        // --- FEATURE: TREND FORECAST LINE ---
-        if (trend) {
-             // Create a Sparse Dataset for the Trend Line
-             const trendData = new Array(labels.length).fill(null);
+        current.setDate(current.getDate() + 1);
+    }
 
-             // A. Find Start Point (Last Real Data Value)
-             // We search backwards from the real data end (not necessarily the chart end now)
-             let lastRealIndex = -1;
-             for (let i = dataValues.length - 1; i >= 0; i--) {
-                 if (dataValues[i] !== null) {
-                     lastRealIndex = i;
-                     break;
-                 }
-             }
+    if (trend && lastVal !== null) {
+        trendData.push({ x: lastTime, y: lastVal });
+        trendData.push({ x: endDate.getTime(), y: tracker.targetValue });
+    }
 
-             // B. Find End Point (The Project Date Index)
-             // Since 'labels' and 'dateArray' are perfectly aligned linear days, 
-             // the last index is always the trend date (because we extended 'endDate' above).
-             const trendEndIndex = labels.length - 1;
+    const strictClip = { left: 0, top: 20, right: 0, bottom: 0 };
 
-             if (lastRealIndex !== -1 && lastRealIndex < trendEndIndex) {
-                 trendData[lastRealIndex] = dataValues[lastRealIndex]; // Start
-                 trendData[trendEndIndex] = tracker.targetValue;       // End
+    const datasets = [{
+        label: tracker.name,
+        data: mainData,
+        borderColor: theme.chartLine,
+        backgroundColor: theme.chartFill,
+        tension: 0.1,
+        fill: true,
+        pointRadius: (ctx) => (ctx.raw?.y === null ? 0 : 3),
+        pointHoverRadius: 6,
+        spanGaps: true,
+        normalized: true,
+        clip: strictClip 
+    }];
 
-                 datasets.push({
-                     label: 'Trend',
-                     data: trendData,
-                     borderColor: '#fbbf24', // Amber/Gold
-                     borderDash: [4, 4],
-                     pointRadius: 4,
-                     pointBackgroundColor: '#fbbf24',
-                     spanGaps: true, // Connects the dot across all the empty days we just added
-                     fill: false,
-                     tension: 0
-                 });
-             }
-        }
+    if (targetData.length > 0) {
+        datasets.push({
+            label: 'Target',
+            data: targetData,
+            borderColor: isAmoled ? '#22c55e' : '#16a34a',
+            borderDash: [5, 5],
+            pointRadius: 0,
+            borderWidth: 1.5,
+            fill: false,
+            clip: strictClip
+        });
+    }
+
+    if (trendData.length > 0) {
+        datasets.push({
+            label: 'Trend',
+            data: trendData,
+            borderColor: '#fbbf24',
+            borderDash: [4, 4],
+            pointRadius: 0,
+            borderWidth: 2,
+            spanGaps: true,
+            fill: false,
+            clip: strictClip
+        });
+    }
+
+    const dayMs = 86400000;
+    
+    return {
+        chartData: { datasets },
+        minDate: startDate.getTime() - (dayMs * 0.05), 
+        maxDate: endDate.getTime() + dayMs,
+        firstEntryDate: startDate.getTime(),
+        lastEntryDate: lastRealEntryDate.getTime(),
+        yMin: finalYMin,
+        yMax: finalYMax
+    };
+};
+
+// --- 2. PURE HELPER: Chart Configuration ---
+const getChartOptions = ({ minDate, maxDate, firstEntryDate, lastEntryDate, yMin, yMax, gridColor, textColor, tracker, onDateClick }) => {
+    
+    const getInitialRange = () => {
+        const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
+        const daysBack = isMobile ? 30 : 60;
+        const dayMs = 86400000;
+        const idealMin = lastEntryDate - (daysBack * dayMs);
+        const idealMax = lastEntryDate + dayMs; 
 
         return {
-            chartData: {
-                labels: labels,
-                datasets: datasets
-            },
-            fullDateLabels: dateArray 
+            min: Math.max(minDate, idealMin), 
+            max: idealMax 
         };
-    }, [entries, tracker, theme, isAmoled]);
+    };
 
-    const gridColor = isAmoled ? '#27272a' : (themeMode === 'dark' ? '#334155' : '#E4E4E7');
-    const textColor = isAmoled || themeMode === 'dark' ? '#A1A1AA' : '#71717A';
+    const initialRange = getInitialRange();
 
-    const options = {
+    return {
         responsive: true,
         maintainAspectRatio: false,
+        animation: false,
+        layout: { padding: { top: 10, bottom: 0, left: 0, right: 10 } },
+        interaction: { mode: 'nearest', axis: 'x', intersect: false },
         plugins: {
             legend: { display: false },
             tooltip: {
                 callbacks: { 
-                    label: (ctx) => ctx.raw === null ? '' : `${ctx.dataset.label}: ${ctx.raw} ${tracker.unit || ''}` 
+                    title: (ctx) => formatDate(new Date(ctx[0].parsed.x)),
+                    label: (ctx) => ctx.raw?.y === null ? '' : `${ctx.dataset.label}: ${ctx.raw.y} ${tracker.unit || ''}` 
                 },
-                filter: (item) => item.raw !== null
+                filter: (item) => item.raw?.y !== null
+            },
+            zoom: {
+                pan: { enabled: true, mode: 'x', threshold: 0 },
+                zoom: { wheel: { enabled: true }, pinch: { enabled: true }, mode: 'x' },
+                limits: { x: { min: minDate, max: maxDate }, y: { min: yMin, max: yMax } }
             }
         },
         scales: {
             y: {
-                beginAtZero: false, 
-                grace: '5%',       
+                min: yMin, max: yMax,
                 grid: { color: gridColor },
-                ticks: { color: textColor }
-            },
-            x: {
-                grid: { display: false },
+                // --- STABILIZER: Lock Y-Axis Width ---
+                // 'afterFit' forces the axis to be exactly 40px wide,
+                // preventing the chart from jittering when label digits change length.
+                afterFit: (scaleInstance) => {
+                    scaleInstance.width = 40; 
+                },
                 ticks: { 
                     color: textColor,
-                    maxTicksLimit: 8, 
-                    maxRotation: 0
+                    padding: 10, 
+                    z: 10 
                 }
-            }
-        },
-        onClick: (event, elements) => {
-            if (elements.length > 0 && onDateClick) {
-                const element = elements.find(el => el.datasetIndex === 0);
-                if (element) {
-                    const index = element.index;
-                    if (index < fullDateLabels.length) {
-                        onDateClick(fullDateLabels[index]);
+            },
+            x: {
+                type: 'time',
+                time: { unit: 'day', tooltipFormat: 'MMM d, yyyy', displayFormats: { day: 'MMM d' } },
+                
+                min: initialRange.min,
+                max: initialRange.max,
+                
+                bounds: 'ticks', 
+                
+                grid: { display: false },
+                ticks: { 
+                    color: textColor, 
+                    minRotation: 45,
+                    maxRotation: 45,
+                    source: 'data',
+                    autoSkip: false,
+                    padding: 8, 
+                    callback: function(val, index) {
+                        const scale = this.chart.scales.x;
+                        const visibleRangeMs = scale.max - scale.min;
+                        const visibleDays = visibleRangeMs / 86400000;
+
+                        let step = 1; 
+                        if (visibleDays > 14) step = 2;   
+                        if (visibleDays > 30) step = 5;   
+                        if (visibleDays > 60) step = 10;  
+                        if (visibleDays > 180) step = 30; 
+
+                        const date = new Date(val);
+                        const daysSinceStart = Math.floor((date.getTime() - firstEntryDate) / 86400000);
+
+                        if (Math.abs(daysSinceStart) % step === 0) {
+                            return formatDate(date); 
+                        }
+                        return null; 
                     }
                 }
             }
+        },
+        onClick: (event, elements, chart) => {
+            if (elements.length > 0 && onDateClick) {
+                const timestamp = chart.scales.x.getValueForPixel(event.x);
+                onDateClick(formatIsoDate(new Date(timestamp)));
+            }
         }
     };
+};
 
-    if (entries.length === 0) {
+// --- 3. MAIN COMPONENT ---
+export const TrackerChart = ({ entries, tracker, onDateClick }) => {
+    const { theme, themeMode, isAmoled } = useTheme();
+    const chartRef = useRef(null);
+
+    const processed = useMemo(() => 
+        processChartData(entries, tracker, theme, isAmoled), 
+    [entries, tracker, theme, isAmoled]);
+
+    const gridColor = isAmoled ? '#27272a' : (themeMode === 'dark' ? '#334155' : '#E4E4E7');
+    const textColor = isAmoled || themeMode === 'dark' ? '#A1A1AA' : '#71717A';
+
+    const options = useMemo(() => 
+        getChartOptions({
+            ...processed,
+            gridColor,
+            textColor,
+            tracker,
+            onDateClick
+        }),
+    [processed, gridColor, textColor, tracker, onDateClick]);
+
+    const handleResetZoom = useCallback(() => {
+        chartRef.current?.resetZoom();
+    }, []);
+
+    if (!entries || entries.length === 0) {
         return <div className="h-full flex items-center justify-center text-zinc-400">No data yet</div>;
     }
 
     return (
-        <div className="h-64 w-full">
-            <Line data={chartData} options={options} />
+        <div className="h-64 w-full relative group" style={{ touchAction: 'pan-y' }}>
+            <Line ref={chartRef} data={processed.chartData} options={options} />
+            
+            <button 
+                onClick={handleResetZoom}
+                className={`
+                    absolute top-2 right-2 p-1.5 rounded-lg shadow-sm border transition-opacity opacity-0 group-hover:opacity-100
+                    ${isAmoled ? 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-white' : 'bg-white border-zinc-200 text-zinc-500 hover:text-zinc-900'}
+                `}
+                title="Reset View"
+            >
+                <RotateCcw className="w-3 h-3" />
+            </button>
         </div>
     );
 };
